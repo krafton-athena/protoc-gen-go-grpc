@@ -1,0 +1,284 @@
+name: Mirror grpc/grpc-go releases (protoc-gen-go-grpc)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Upstream repo to mirror"
+        required: false
+        default: "grpc/grpc-go"
+      goos_list:
+        description: 'JSON array of GOOS (e.g. ["linux","darwin","windows"])'
+        required: false
+        default: '["linux","darwin","windows"]'
+      goarch_list:
+        description: 'JSON array of GOARCH (e.g. ["amd64","arm64"])'
+        required: false
+        default: '["amd64","arm64"]'
+      min_version:
+        description: 'Only mirror tags >= this version (e.g. v1.32.0). Leave blank for all.'
+        required: false
+  schedule:
+    - cron: "0 18 * * *" # 매일 03:00 KST
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      versions:    ${{ steps.diff.outputs.versions }}
+      source_repo: ${{ steps.resolve.outputs.repo }}
+      goos_list:   ${{ steps.axes.outputs.goos_list }}
+      goarch_list: ${{ steps.axes.outputs.goarch_list }}
+    steps:
+      - name: Resolve source repo
+        id: resolve
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.source_repo }}" ]; then
+            echo "repo=${{ github.event.inputs.source_repo }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo=grpc/grpc-go" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve build axes (JSON-safe)
+        id: axes
+        shell: bash
+        run: |
+          GOOS_LIST='${{ github.event.inputs.goos_list }}'
+          GOARCH_LIST='${{ github.event.inputs.goarch_list }}'
+          [ -z "$GOOS_LIST" ]  && GOOS_LIST='["linux","darwin","windows"]'
+          [ -z "$GOARCH_LIST" ] && GOARCH_LIST='["amd64","arm64"]'
+          echo "$GOOS_LIST"  | jq -e type >/dev/null 2>&1 || GOOS_LIST='["linux","darwin","windows"]'
+          echo "$GOARCH_LIST" | jq -e type >/dev/null 2>&1 || GOARCH_LIST='["amd64","arm64"]'
+          echo "goos_list=$GOOS_LIST"     >> "$GITHUB_OUTPUT"
+          echo "goarch_list=$GOARCH_LIST" >> "$GITHUB_OUTPUT"
+
+      - name: Compute TODO tags (upstream releases, semver, >=min_version)
+        id: diff
+        env:
+          SRC_REPO: ${{ steps.resolve.outputs.repo }}
+          GOOS_LIST: ${{ steps.axes.outputs.goos_list }}
+          GOARCH_LIST: ${{ steps.axes.outputs.goarch_list }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIN_VERSION: ${{ github.event.inputs.min_version || 'v1.30.0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # helpers
+          norm() { sed -E 's/^v//' <<<"$1"; }
+          ge_semver() { # ge_semver A B => 0 if A >= B (B can be empty)
+            [ -z "${2:-}" ] && return 0
+            local A B; A="$(norm "$1")"; B="$(norm "$2")"
+            [ "$(printf '%s\n' "$A" "$B" | sort -V | head -n1)" = "$B" ]
+          }
+
+          # A) Upstream RELEASE tags ONLY (exclude draft/prerelease), keep ^vX.Y.Z$
+          mapfile -t REL_NEW2OLD < <(
+            gh api "/repos/${SRC_REPO}/releases?per_page=100" --paginate \
+            | jq -r '.[] | select((.draft|not) and (.prerelease|not)) | .tag_name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true
+          )
+
+          # B) Apply min_version (inclusive)
+          FILTERED=()
+          for t in "${REL_NEW2OLD[@]}"; do
+            if ge_semver "$t" "${MIN_VERSION:-}"; then
+              FILTERED+=("$t")
+            fi
+          done
+
+          # C) Order oldest→newest for stable backfill
+          TAGS=()
+          for (( i=${#FILTERED[@]}-1; i>=0; i-- )); do TAGS+=("${FILTERED[i]}"); done
+
+          # D) Our repo releases' assets by tag
+          declare -A ASSETS_BY_TAG
+          while IFS=$'\t' read -r tag names_json; do
+            if [ "$names_json" = "null" ] || [ -z "$names_json" ]; then
+              ASSETS_BY_TAG["$tag"]=""
+            else
+              ASSETS_BY_TAG["$tag"]="$(echo "$names_json" | jq -r '.[]?')"
+            fi
+          done < <(
+            gh api "/repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate \
+             | jq -r '.[] | [.tag_name, ((.assets // []) | map(.name) | @json)] | @tsv'
+          )
+
+          # E) Decide TODO tags (missing any GOOS/GOARCH asset)
+          TODO_TAGS=()
+          for tag in "${TAGS[@]}"; do
+            assets="${ASSETS_BY_TAG[$tag]:-}"
+            missing="false"
+            for goos in $(echo "$GOOS_LIST" | jq -r '.[]'); do
+              for goarch in $(echo "$GOARCH_LIST" | jq -r '.[]'); do
+                ext=""; [ "$goos" = "windows" ] && ext=".exe"
+                expected="protoc-gen-go-grpc-${tag}-${goos}-${goarch}${ext}"
+                if ! grep -Fxq "$expected" <<< "$assets"; then
+                  missing="true"; break 2
+                fi
+              done
+            done
+            [ "$missing" = "true" ] && TODO_TAGS+=("$tag")
+          done
+
+          # F) Emit matrix list
+          if [ ${#TODO_TAGS[@]} -eq 0 ]; then
+            JSON='[]'
+          else
+            JSON="$(printf '%s\n' "${TODO_TAGS[@]}" \
+              | jq -R -s 'split("\n")|map(select(length>0))' | jq -c '.')"
+          fi
+          echo "versions=$JSON" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    name: Build & Release ${{ matrix.tag }} (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: plan
+    if: ${{ needs.plan.outputs.versions != '' && needs.plan.outputs.versions != '[]' }}
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        tag:    ${{ fromJSON(needs.plan.outputs.versions) }}
+        goos:   ${{ fromJSON(needs.plan.outputs.goos_list) }}
+        goarch: ${{ fromJSON(needs.plan.outputs.goarch_list) }}
+
+    steps:
+      - name: Check release & asset existence (via REST)
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ matrix.tag }}'
+          goos='${{ matrix.goos }}'
+          goarch='${{ matrix.goarch }}'
+          ext=""; [ "$goos" = "windows" ] && ext=".exe"
+          expected="protoc-gen-go-grpc-${tag}-${goos}-${goarch}${ext}"
+
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${tag}"
+          http=$(curl -sS -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$api" -o /tmp/release.json || true)
+          if [ "$http" = "404" ]; then
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "asset_exists=false"   >> "$GITHUB_OUTPUT"
+            echo "expected=$expected"   >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$http" != "200" ]; then
+            echo "::error::GitHub API $api failed (HTTP $http)"; cat /tmp/release.json || true; exit 1
+          fi
+          names=$(jq -r '.assets[]?.name' /tmp/release.json)
+          if grep -Fxq "$expected" <<< "$names"; then
+            echo "release_exists=true"  >> "$GITHUB_OUTPUT"
+            echo "asset_exists=true"    >> "$GITHUB_OUTPUT"
+          else
+            echo "release_exists=true"  >> "$GITHUB_OUTPUT"
+            echo "asset_exists=false"   >> "$GITHUB_OUTPUT"
+          fi
+          echo "expected=$expected"     >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        if: steps.check.outputs.release_exists == 'false' || steps.check.outputs.asset_exists == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+
+      - name: Checkout upstream tag
+        if: steps.check.outputs.release_exists == 'false' || steps.check.outputs.asset_exists == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.plan.outputs.source_repo }}
+          ref: ${{ matrix.tag }}
+          fetch-depth: 1
+          path: src-${{ matrix.tag }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          clean: true
+
+      - name: Set SRC_DIR
+        if: steps.check.outputs.release_exists == 'false' || steps.check.outputs.asset_exists == 'false'
+        shell: bash
+        run: echo "SRC_DIR=src-${{ matrix.tag }}-${{ matrix.goos }}-${{ matrix.goarch }}" >> "$GITHUB_ENV"
+
+      - name: Build protoc-gen-go-grpc (module or GOPATH; submodule-aware)
+        if: steps.check.outputs.release_exists == 'false' || steps.check.outputs.asset_exists == 'false'
+        working-directory: ${{ env.SRC_DIR }}
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+
+          ROOT="$(pwd)"
+          OUTBASE="$(dirname "$ROOT")"
+          OUTDIR="$OUTBASE/dist/${{ matrix.tag }}/${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "$OUTDIR"
+
+          FINAL="$OUTBASE/${{ steps.check.outputs.expected }}"
+          bin="$(basename "$FINAL")"
+
+          PKG_DIR="cmd/protoc-gen-go-grpc"
+          [ -d "$PKG_DIR" ] || PKG_DIR="protoc-gen-go-grpc"
+
+          if [ -f "$PKG_DIR/go.mod" ]; then
+            echo "==> Module mode build (submodule at $PKG_DIR)"
+            go build -C "$PKG_DIR" -trimpath -ldflags="-s -w" -o "$OUTDIR/$bin" .
+          else
+            if [ -f go.mod ]; then
+              echo "==> Module mode build (single-module at repo root)"
+              go build -trimpath -ldflags="-s -w" -o "$OUTDIR/$bin" "./$PKG_DIR"
+            else
+              echo "==> GOPATH mode build"
+              export GOPATH="${RUNNER_TEMP:-/tmp}/gopath"
+              export GOCACHE="${RUNNER_TEMP:-/tmp}/gocache"
+              mkdir -p "$GOPATH/src/google.golang.org" "$GOCACHE"
+
+              rm -rf "$GOPATH/src/google.golang.org/grpc"
+              cp -a "$ROOT" "$GOPATH/src/google.golang.org/grpc"
+              cd "$GOPATH/src/google.golang.org/grpc"
+
+              # pre-modules 태그 대비 의존성 프리페치
+              GO111MODULE=off go get -u -d "./$PKG_DIR" || true
+              GO111MODULE=off go get -u -d . || true
+
+              GO111MODULE=off go build -trimpath -ldflags="-s -w" -o "$OUTDIR/$bin" "./$PKG_DIR"
+              cd "$ROOT"
+            fi
+          fi
+
+          cp -f LICENSE "$OUTDIR/" 2>/dev/null || true
+          cp -f README* "$OUTDIR/" 2>/dev/null || true
+
+          cp "$OUTDIR/$bin" "$FINAL"
+          echo "BIN=$FINAL" >> "$GITHUB_ENV"
+
+      - name: Create release & upload (new release)
+        if: steps.check.outputs.release_exists == 'false' && env.BIN != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.tag }}
+          name: ${{ matrix.tag }}
+          body: |
+            Automated mirror build of `protoc-gen-go-grpc` from `${{ needs.plan.outputs.source_repo }}` at tag `${{ matrix.tag }}`.
+          files: ${{ env.BIN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload only missing asset to existing release
+        if: steps.check.outputs.release_exists == 'true' && steps.check.outputs.asset_exists == 'false' && env.BIN != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ matrix.tag }}
+          files: ${{ env.BIN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Skip (asset already present)
+        if: steps.check.outputs.release_exists == 'true' && steps.check.outputs.asset_exists == 'true'
+        shell: bash
+        run: echo "Asset '${{ steps.check.outputs.expected }}' already exists in release '${{ matrix.tag }}'. Skipping."
